@@ -1,3 +1,5 @@
+# main.py
+
 import asyncio
 import os
 from rich.console import Console
@@ -22,7 +24,7 @@ async def run_canvas_flow():
     if not tz:
         tz = "UTC"
 
-    # We assume load_credentials() is already called, so env vars are set
+    # Load environment variables
     canvas_url = os.getenv("CANVAS_API_URL", "")
     canvas_key = os.getenv("CANVAS_API_KEY", "")
     openai_key = os.getenv("OPENAI_API_KEY", "")
@@ -74,7 +76,7 @@ async def main():
         elif choice == "3":
             delete_credentials()
         elif choice == "4":
-            # We must load credentials before running the flow
+            # Load credentials before running the flow
             if load_credentials():
                 await run_canvas_flow()
         elif choice == "5":

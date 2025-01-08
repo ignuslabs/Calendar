@@ -1,8 +1,12 @@
+# canvas_calendar_generator.py
+
 import os
 import asyncio
 import spacy
 import PyPDF2
 import docx
+import zipfile
+import time
 
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta, timezone
@@ -26,14 +30,14 @@ console = Console()
 
 class CanvasCalendarGenerator:
     """
-    Revised CanvasCalendarGenerator that ensures we:
-    1) Fetch Canvas assignments
-    2) Ensure we check for a "Syllabus" via course.syllabus_body first
-    3) If not found, gather text from front page, course files, and modules
-    4) Pass that text to GPT
-    5) Cross-reference GPT results with assignments
-    6) Prompt for missing data
-    7) Generate ICS after final data is ready
+    CanvasCalendarGenerator performs the following steps:
+    1. Fetch Canvas assignments.
+    2. Check for syllabus in course.syllabus_body.
+    3. If not found, gather text from front page, files, and modules.
+    4. Use GPT to parse assignment data.
+    5. Cross-reference GPT data with Canvas assignments.
+    6. Prompt user for missing due dates.
+    7. Generate an ICS calendar file.
     """
 
     def __init__(self,
@@ -52,7 +56,7 @@ class CanvasCalendarGenerator:
         # Initialize GPT parser
         self.gpt_parser = GPTParser(self.openai_api_key)
 
-        # SpaCy model for name similarity
+        # Load SpaCy model for name similarity
         self.nlp = spacy.load("en_core_web_sm")
 
     def get_user_courses(self) -> List[Course]:
@@ -60,7 +64,7 @@ class CanvasCalendarGenerator:
         Retrieve and display courses for the current user.
         """
         try:
-            # We can show a quick progress for courses
+            # Display a progress spinner while fetching courses
             with Progress(transient=True) as progress:
                 task = progress.add_task("Fetching user courses...", total=None)
                 courses = list(self.canvas.get_courses())
@@ -69,6 +73,7 @@ class CanvasCalendarGenerator:
                 console.print("[red]No courses found for this user.[/red]")
                 return []
             
+            # Display courses in a table format
             table = Table(title="Your Courses")
             table.add_column("Number", justify="right", style="cyan")
             table.add_column("Course Name", style="magenta")
@@ -85,19 +90,19 @@ class CanvasCalendarGenerator:
 
     async def process_course(self, course: Course) -> None:
         """
-        Full workflow for a single course:
-        1) Fetch Canvas assignments
-        2) Gather text from course.syllabus_body if present
-        3) Gather additional text from front page, files, modules if needed
-        4) GPT parse that text
-        5) Cross-reference results with assignments
-        6) Prompt user for missing data
-        7) Generate ICS
+        Process a single course through all steps:
+        1. Fetch assignments.
+        2. Check syllabus_body.
+        3. Gather additional text if needed.
+        4. Parse with GPT.
+        5. Cross-reference assignments.
+        6. Handle missing due dates.
+        7. Generate ICS calendar.
         """
         try:
             console.print(f"\n[bold green]Course:[/bold green] {course.name}\n")
 
-            # Use a single progress bar for major steps
+            # Use a single progress bar for all major steps
             with Progress(transient=True) as progress:
                 task = progress.add_task(f"Processing {course.name}...", total=5)
 
@@ -106,19 +111,19 @@ class CanvasCalendarGenerator:
                 assignments = list(course.get_assignments())
                 console.print(f"{len(assignments)} total assignments found.")
 
-                # Step 2: Check if course.syllabus_body has content
+                # Step 2: Check if syllabus_body has content
                 progress.update(task, advance=1, description="Checking course syllabus...")
                 raw_syllabus_body = getattr(course, "syllabus_body", "") or ""
 
                 # Step 3: If syllabus_body is empty, gather more text
                 progress.update(task, advance=1, description="Gathering additional text...")
                 if raw_syllabus_body.strip():
-                    # We already have some textual content
+                    # Use syllabus_body as the text source
                     all_text = raw_syllabus_body
                 else:
-                    # Fallback: gather from front page, files, modules
+                    # Fallback: gather from front page, files, and modules
                     all_text = await self._gather_additional_text(course)
-                
+
                 # Step 4: GPT parse if we have text
                 gpt_data = []
                 if all_text.strip():
@@ -128,11 +133,11 @@ class CanvasCalendarGenerator:
                     console.print("[yellow]No textual materials found. Skipping GPT parse.[/yellow]")
                     progress.update(task, advance=1)
 
-                # Step 5: Cross-reference
+                # Step 5: Cross-reference assignments
                 progress.update(task, advance=1, description="Cross-referencing assignments...")
                 self._match_assignments_with_dates(assignments, gpt_data)
 
-            # Step 6: Prompt user for missing data
+            # Step 6: Prompt user for missing due dates
             missing = [a for a in assignments if not getattr(a, "due_at", None)]
             if missing:
                 console.print(f"\n[bold][yellow]{len(missing)} assignments are still missing due dates.[/yellow][/bold]")
@@ -140,9 +145,9 @@ class CanvasCalendarGenerator:
                 if choice == 'y':
                     self._handle_manual_dates(missing)
 
-            # Step 7: Generate ICS
+            # Step 7: Generate ICS calendar
             with Progress(transient=True) as progress:
-                t2 = progress.add_task("Generating ICS file...", total=None)
+                progress.add_task("Generating ICS file...", total=None)
                 self._generate_calendar(assignments, course.name)
 
             console.print("[green]Done processing course.[/green]\n")
@@ -175,7 +180,7 @@ class CanvasCalendarGenerator:
         if module_text:
             text_parts.append(module_text)
 
-        # Combine everything
+        # Combine all gathered text
         return "\n\n".join(text_parts)
 
     def _get_front_page_text(self, course: Course) -> str:
@@ -198,7 +203,8 @@ class CanvasCalendarGenerator:
         text_chunks = []
         try:
             file_list = list(course.get_files())
-        except:
+        except Exception as e:
+            console.print(f"[red]Error fetching course files: {e}[/red]")
             return ""
 
         relevant_exts = [".pdf", ".docx", ".txt"]
@@ -206,7 +212,7 @@ class CanvasCalendarGenerator:
         for f_obj in file_list:
             fname = (f_obj.display_name or f_obj.filename).lower()
             if any(fname.endswith(ext) for ext in relevant_exts):
-                extracted = self._download_and_extract_file(f_obj)
+                extracted = self._download_and_extract_file(f_obj, retries=3, delay=2)
                 if extracted:
                     text_chunks.append(extracted)
 
@@ -215,13 +221,13 @@ class CanvasCalendarGenerator:
     async def _gather_module_texts(self, course: Course) -> str:
         """
         Look through modules. Download any PDF/DOCX/TXT files found. 
-        You can optionally filter module names or item titles if needed.
         Return combined text from all found items.
         """
         text_chunks = []
         try:
             modules = list(course.get_modules())
-        except:
+        except Exception as e:
+            console.print(f"[red]Error fetching modules: {e}[/red]")
             return ""
 
         for mod in modules:
@@ -229,63 +235,95 @@ class CanvasCalendarGenerator:
             for it in items:
                 # If the item is a file, we can parse it
                 if it.type == "File":
-                    f_obj = it.get_file()
-                    fname = (f_obj.display_name or f_obj.filename).lower()
-                    if any(fname.endswith(ext) for ext in [".pdf", ".docx", ".txt"]):
-                        extracted = self._download_and_extract_file(f_obj)
-                        if extracted:
-                            text_chunks.append(extracted)
+                    try:
+                        # Retrieve the File object using course.get_file with content_id
+                        f_obj = course.get_file(it.content_id)
+                        fname = (f_obj.display_name or f_obj.filename).lower()
+                        if any(fname.endswith(ext) for ext in [".pdf", ".docx", ".txt"]):
+                            extracted = self._download_and_extract_file(f_obj, retries=3, delay=2)
+                            if extracted:
+                                text_chunks.append(extracted)
+                    except Exception as e:
+                        console.print(f"[red]Error retrieving file from module item '{it.title}': {e}[/red]")
+                        continue
 
         return "\n\n".join(text_chunks)
 
-    def _download_and_extract_file(self, file_obj) -> str:
+    def _download_and_extract_file(self, file_obj: CanvasFile, retries: int = 3, delay: int = 2) -> Optional[str]:
         """
         Download a PDF, DOCX, or TXT file from Canvas, and return extracted text.
+        Implements a retry mechanism for transient errors.
         """
-        try:
-            fname = file_obj.filename
-            console.print(f"Downloading file: {fname}")
-            content = file_obj.get_contents()
+        for attempt in range(1, retries + 1):
+            try:
+                fname = file_obj.filename
+                console.print(f"Downloading file: {fname} (Attempt {attempt})")
+                content = file_obj.get_contents()
 
-            if isinstance(content, str):
-                content = content.encode("utf-8")
+                if isinstance(content, str):
+                    content = content.encode("utf-8")
 
-            with open(fname, "wb") as f:
-                f.write(content)
+                with open(fname, "wb") as f:
+                    f.write(content)
 
-            # Extract text by extension
-            fname_lower = fname.lower()
-            if fname_lower.endswith(".pdf"):
-                return self._extract_pdf_text(fname)
-            elif fname_lower.endswith(".docx"):
-                return self._extract_docx_text(fname)
-            elif fname_lower.endswith(".txt"):
-                with open(fname, "r", encoding="utf-8", errors="ignore") as tf:
-                    return tf.read()
-            else:
-                return ""
-        except Exception as ex:
-            console.print(f"[red]Error downloading/extracting file '{file_obj.filename}': {ex}[/red]")
-            return ""
+                # Extract text based on file extension
+                fname_lower = fname.lower()
+                if fname_lower.endswith(".pdf"):
+                    return self._extract_pdf_text(fname)
+                elif fname_lower.endswith(".docx"):
+                    extracted_text = self._extract_docx_text(fname)
+                    if extracted_text:
+                        return extracted_text
+                    else:
+                        console.print(f"[red]Failed to extract text from DOCX '{fname}'.[/red]")
+                        return ""
+                elif fname_lower.endswith(".txt"):
+                    with open(fname, "r", encoding="utf-8", errors="ignore") as tf:
+                        return tf.read()
+                else:
+                    return ""
+            except Exception as ex:
+                console.print(f"[red]Error downloading/extracting file '{file_obj.filename}' (Attempt {attempt}): {ex}[/red]")
+                if attempt < retries:
+                    console.print(f"[yellow]Retrying in {delay} seconds...[/yellow]")
+                    time.sleep(delay)
+                else:
+                    console.print(f"[red]Failed to download/extract '{file_obj.filename}' after {retries} attempts.[/red]")
+                    return ""
 
     def _extract_pdf_text(self, pdf_path: str) -> str:
         """
         Extract text from a PDF using PyPDF2.
         """
         text = ""
-        with open(pdf_path, "rb") as f:
-            reader = PyPDF2.PdfReader(f)
-            for page in reader.pages:
-                p_txt = page.extract_text() or ""
-                text += p_txt + "\n"
+        try:
+            with open(pdf_path, "rb") as f:
+                reader = PyPDF2.PdfReader(f)
+                for page in reader.pages:
+                    p_txt = page.extract_text() or ""
+                    text += p_txt + "\n"
+        except Exception as e:
+            console.print(f"[red]Error extracting text from PDF '{pdf_path}': {e}[/red]")
         return text
 
-    def _extract_docx_text(self, docx_path: str) -> str:
+    def _extract_docx_text(self, docx_path: str) -> Optional[str]:
         """
         Extract text from a DOCX file using python-docx.
         """
-        d = docx.Document(docx_path)
-        return "\n".join(p.text for p in d.paragraphs)
+        try:
+            # Verify if the DOCX file is a valid ZIP archive
+            if not zipfile.is_zipfile(docx_path):
+                console.print(f"[red]DOCX file '{docx_path}' is not a valid ZIP archive. It may be corrupted.[/red]")
+                return None
+
+            d = docx.Document(docx_path)
+            return "\n".join(p.text for p in d.paragraphs)
+        except zipfile.BadZipFile:
+            console.print(f"[red]DOCX file '{docx_path}' is corrupted (BadZipFile).[/red]")
+            return None
+        except Exception as e:
+            console.print(f"[red]Error extracting text from DOCX '{docx_path}': {e}[/red]")
+            return None
 
     def _match_assignments_with_dates(self, assignments: List[Assignment], gpt_data: List[Dict]) -> None:
         """
@@ -330,7 +368,7 @@ class CanvasCalendarGenerator:
             dt_utc = dt_local.astimezone(timezone.utc)
             assignment.due_at = dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
         except ValueError:
-            pass
+            console.print(f"[red]Invalid date format '{date_str}' for assignment '{assignment.name}'.[/red]")
 
     def _handle_manual_dates(self, assignments: List[Assignment]) -> None:
         """
@@ -357,7 +395,20 @@ class CanvasCalendarGenerator:
 
                 date_parsed = date_parsed.replace(hour=hour, minute=minute)
                 dt_utc = date_parsed.astimezone(timezone.utc)
-                a.due_at = dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+                assignment_due_at = dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+                # Optionally, update the assignment on Canvas
+                # Uncomment the following lines if you want to persist the change to Canvas
+                # try:
+                #     assignment_data = {'assignment': {'due_at': assignment_due_at}}
+                #     a.edit(**assignment_data)
+                #     console.print(f"[green]Updated due date for '{a.name}' on Canvas.[/green]")
+                # except Exception as e:
+                #     console.print(f"[red]Failed to update due date for '{a.name}': {e}[/red]")
+
+                # For now, just set it locally
+                a.due_at = assignment_due_at
+                console.print(f"[green]Due date set for '{a.name}'.[/green]")
                 break
 
     def _try_parse_date(self, date_str: str) -> Optional[datetime]:
@@ -392,6 +443,7 @@ class CanvasCalendarGenerator:
             try:
                 dt_utc = datetime.strptime(a.due_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
             except ValueError:
+                console.print(f"[red]Invalid due_at format for assignment '{a.name}': {a.due_at}[/red]")
                 continue
 
             dt_local = dt_utc.astimezone(local_zone)
@@ -410,6 +462,9 @@ class CanvasCalendarGenerator:
             cal.add_component(event)
 
         filename = f"{course_name.replace(' ', '_')}_calendar.ics"
-        with open(filename, "wb") as f:
-            f.write(cal.to_ical())
-        console.print(f"[green]Calendar saved as {filename}[/green]\n")
+        try:
+            with open(filename, "wb") as f:
+                f.write(cal.to_ical())
+            console.print(f"[green]Calendar saved as {filename}[/green]\n")
+        except Exception as e:
+            console.print(f"[red]Failed to save calendar file '{filename}': {e}[/red]")
