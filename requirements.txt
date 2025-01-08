@@ -1,3 +1,5 @@
+# requirements.txt
+
 python-dotenv
 canvasapi
 openai
@@ -5,3 +7,4 @@ spacy
 PyPDF2
 python-docx
 rich
+icalendar
