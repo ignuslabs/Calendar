@@ -1,4 +1,5 @@
 import asyncio
+import os
 from rich.console import Console
 
 # Local imports
@@ -22,7 +23,6 @@ async def run_canvas_flow():
         tz = "UTC"
 
     # We assume load_credentials() is already called, so env vars are set
-    import os
     canvas_url = os.getenv("CANVAS_API_URL", "")
     canvas_key = os.getenv("CANVAS_API_KEY", "")
     openai_key = os.getenv("OPENAI_API_KEY", "")
@@ -63,7 +63,7 @@ async def main():
         console.print("1) Set .env credentials")
         console.print("2) Load .env credentials")
         console.print("3) Delete .env file")
-        console.print("4) Start Canvas Calendar Flow (Files + Modules + Syllabus fallback)")
+        console.print("4) Start Canvas Calendar Flow (Syllabus + GPT + ICS)")
         console.print("5) Exit")
 
         choice = console.input("Choice: ").strip()

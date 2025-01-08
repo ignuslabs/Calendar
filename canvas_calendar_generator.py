@@ -1,26 +1,23 @@
 import os
-import re
-import json
 import asyncio
 import spacy
-from typing import List, Dict, Optional, Union
+import PyPDF2
+import docx
+
+from typing import List, Dict, Optional
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-# canvasapi
 from canvasapi import Canvas
 from canvasapi.course import Course
 from canvasapi.assignment import Assignment
 from canvasapi.file import File as CanvasFile
 from canvasapi.module import Module, ModuleItem
 
-# Additional libs
-import PyPDF2
-import docx
 from icalendar import Calendar, Event
 from rich.console import Console
+from rich.progress import Progress
 from rich.table import Table
-from rich.progress import Progress, SpinnerColumn, TextColumn
 
 # Local imports
 from gpt_parser import GPTParser
@@ -29,12 +26,14 @@ console = Console()
 
 class CanvasCalendarGenerator:
     """
-    Revised CanvasCalendarGenerator that:
-    1) Fetches assignments from Canvas
-    2) Gathers textual content from possible syllabus sources
-    3) Passes all text to GPT for date/assignment data
-    4) Cross-references with Canvas assignments
-    5) Generates ICS only after we have final assignment info
+    Revised CanvasCalendarGenerator that ensures we:
+    1) Fetch Canvas assignments
+    2) Ensure we check for a "Syllabus" via course.syllabus_body first
+    3) If not found, gather text from front page, course files, and modules
+    4) Pass that text to GPT
+    5) Cross-reference GPT results with assignments
+    6) Prompt for missing data
+    7) Generate ICS after final data is ready
     """
 
     def __init__(self,
@@ -61,11 +60,11 @@ class CanvasCalendarGenerator:
         Retrieve and display courses for the current user.
         """
         try:
-            with Progress(SpinnerColumn(),
-                          TextColumn("[progress.description]{task.description}"),
-                          transient=True) as progress:
-                progress.add_task(description="Fetching user courses...", total=None)
+            # We can show a quick progress for courses
+            with Progress(transient=True) as progress:
+                task = progress.add_task("Fetching user courses...", total=None)
                 courses = list(self.canvas.get_courses())
+            
             if not courses:
                 console.print("[red]No courses found for this user.[/red]")
                 return []
@@ -88,82 +87,96 @@ class CanvasCalendarGenerator:
         """
         Full workflow for a single course:
         1) Fetch Canvas assignments
-        2) Gather all text from possible syllabus locations
-        3) GPT parse that text
-        4) Cross-reference results with assignments
-        5) Prompt user for any missing data or manual adjustments
-        6) Generate ICS
+        2) Gather text from course.syllabus_body if present
+        3) Gather additional text from front page, files, modules if needed
+        4) GPT parse that text
+        5) Cross-reference results with assignments
+        6) Prompt user for missing data
+        7) Generate ICS
         """
         try:
-            with Progress() as progress:
-                task = progress.add_task(f"Processing {course.name}...", total=100)
-                
+            console.print(f"\n[bold green]Course:[/bold green] {course.name}\n")
+
+            # Use a single progress bar for major steps
+            with Progress(transient=True) as progress:
+                task = progress.add_task(f"Processing {course.name}...", total=5)
+
                 # Step 1: Fetch assignments
-                progress.update(task, advance=20, description="Fetching assignments...")
+                progress.update(task, advance=1, description="Fetching assignments...")
                 assignments = list(course.get_assignments())
-                console.print(f"\n[green]Course:[/green] {course.name}")
-                console.print(f"{len(assignments)} total assignments found.\n")
+                console.print(f"{len(assignments)} total assignments found.")
 
-                # Step 2: Gather all text from possible syllabus sources
-                progress.update(task, advance=20, description="Gathering syllabus text...")
-                all_text = await self._gather_all_text(course)
-                if not all_text.strip():
-                    console.print("[yellow]No textual materials found. Skipping GPT parse.[/yellow]")
+                # Step 2: Check if course.syllabus_body has content
+                progress.update(task, advance=1, description="Checking course syllabus...")
+                raw_syllabus_body = getattr(course, "syllabus_body", "") or ""
+
+                # Step 3: If syllabus_body is empty, gather more text
+                progress.update(task, advance=1, description="Gathering additional text...")
+                if raw_syllabus_body.strip():
+                    # We already have some textual content
+                    all_text = raw_syllabus_body
                 else:
-                    # Step 3: GPT parse that text
-                    progress.update(task, advance=20, description="Parsing text with GPT...")
+                    # Fallback: gather from front page, files, modules
+                    all_text = await self._gather_additional_text(course)
+                
+                # Step 4: GPT parse if we have text
+                gpt_data = []
+                if all_text.strip():
+                    progress.update(task, advance=1, description="Parsing text with GPT...")
                     gpt_data = await self.gpt_parser.parse_assignments_from_text(all_text)
+                else:
+                    console.print("[yellow]No textual materials found. Skipping GPT parse.[/yellow]")
+                    progress.update(task, advance=1)
 
-                    # Step 4: Cross-reference with existing assignments
-                    progress.update(task, advance=10, description="Cross-referencing assignments...")
-                    self._match_assignments_with_dates(assignments, gpt_data)
+                # Step 5: Cross-reference
+                progress.update(task, advance=1, description="Cross-referencing assignments...")
+                self._match_assignments_with_dates(assignments, gpt_data)
 
-                # Step 5: For any assignments still missing dates, prompt user
-                missing = [a for a in assignments if not getattr(a, "due_at", None)]
-                if missing:
-                    console.print(f"\n[bold][yellow]{len(missing)} assignments still missing due dates.[/yellow][/bold]")
-                    choice = console.input("[cyan]Enter 'y' to manually enter them, or any other key to skip:[/cyan] ").lower().strip()
-                    if choice == 'y':
-                        self._handle_manual_dates(missing)
+            # Step 6: Prompt user for missing data
+            missing = [a for a in assignments if not getattr(a, "due_at", None)]
+            if missing:
+                console.print(f"\n[bold][yellow]{len(missing)} assignments are still missing due dates.[/yellow][/bold]")
+                choice = console.input("[cyan]Enter 'y' to manually enter them, or any other key to skip: [/cyan]").lower().strip()
+                if choice == 'y':
+                    self._handle_manual_dates(missing)
 
-                # Step 6: Generate ICS
-                progress.update(task, advance=20, description="Generating ICS file...")
+            # Step 7: Generate ICS
+            with Progress(transient=True) as progress:
+                t2 = progress.add_task("Generating ICS file...", total=None)
                 self._generate_calendar(assignments, course.name)
 
-                progress.update(task, advance=10, description="Done!")
+            console.print("[green]Done processing course.[/green]\n")
+
         except Exception as ex:
             console.print(f"[red]Error processing {course.name}: {ex}[/red]")
 
-    async def _gather_all_text(self, course: Course) -> str:
+    async def _gather_additional_text(self, course: Course) -> str:
         """
-        Gather all relevant text for GPT from:
-        1) Front page
-        2) Course files (look for PDF/DOCX/TXT or anything that might have 'syllabus' or relevant name)
-        3) Modules that might be named 'Intro', 'Materials', etc. or contain files
-        Return combined text.
+        If course.syllabus_body is empty, gather text from:
+          - front page
+          - course files (.pdf, .docx, .txt)
+          - modules
+        Return a combined string of text.
         """
-        combined_text = []
+        text_parts = []
 
-        # A) Try front-page
+        # A) Front page
         fp_text = self._get_front_page_text(course)
         if fp_text:
-            combined_text.append(fp_text)
+            text_parts.append(fp_text)
 
-        # B) Try course files
-        #    (Look for any file that might be relevant, e.g., containing 'syllabus', 'intro', etc. or
-        #     just gather all PDF/DOCX/TXT if you want a broad approach.)
+        # B) Course files
         file_text = await self._gather_file_texts(course)
         if file_text:
-            combined_text.append(file_text)
+            text_parts.append(file_text)
 
-        # C) Check modules for additional files
-        #    (Look for module titles like 'intro', 'material', 'syllabus' or anything you consider relevant.)
+        # C) Modules
         module_text = await self._gather_module_texts(course)
         if module_text:
-            combined_text.append(module_text)
+            text_parts.append(module_text)
 
         # Combine everything
-        return "\n\n".join(combined_text)
+        return "\n\n".join(text_parts)
 
     def _get_front_page_text(self, course: Course) -> str:
         """
@@ -179,9 +192,8 @@ class CanvasCalendarGenerator:
 
     async def _gather_file_texts(self, course: Course) -> str:
         """
-        Look through the course files. If a file extension is .pdf, .docx, or .txt, 
-        download & extract text. You may filter by filenames containing 'syllabus',
-        'intro', 'material', etc., or just gather them all if desired.
+        Look through the course files. If a file extension is .pdf, .docx, or .txt,
+        download & extract text. Return the combined text from all relevant files.
         """
         text_chunks = []
         try:
@@ -189,15 +201,11 @@ class CanvasCalendarGenerator:
         except:
             return ""
 
-        # Example filtering approach: only parse relevant file types
         relevant_exts = [".pdf", ".docx", ".txt"]
 
         for f_obj in file_list:
             fname = (f_obj.display_name or f_obj.filename).lower()
             if any(fname.endswith(ext) for ext in relevant_exts):
-                # Optional: also check if "syllabus" or "intro" etc. in name
-                # if "syllabus" not in fname and "intro" not in fname:
-                #     continue
                 extracted = self._download_and_extract_file(f_obj)
                 if extracted:
                     text_chunks.append(extracted)
@@ -206,8 +214,9 @@ class CanvasCalendarGenerator:
 
     async def _gather_module_texts(self, course: Course) -> str:
         """
-        Look through modules that might be called 'intro', 'materials', 'syllabus', etc.
-        Download any relevant PDF/DOCX/TXT files from them. Combine all extracted text.
+        Look through modules. Download any PDF/DOCX/TXT files found. 
+        You can optionally filter module names or item titles if needed.
+        Return combined text from all found items.
         """
         text_chunks = []
         try:
@@ -215,25 +224,17 @@ class CanvasCalendarGenerator:
         except:
             return ""
 
-        # Example approach: fuzzy match module names for 'intro', 'material', 'syllabus'
-        relevant_keywords = ["syllabus", "intro", "material"]
-
         for mod in modules:
-            mod_name = mod.name.lower()
-            if any(kw in mod_name for kw in relevant_keywords):
-                items = list(mod.get_module_items())
-                for it in items:
-                    # If the item is a file, we extract it
-                    if it.type == "File":
-                        f_obj = it.get_file()
-                        fname = (f_obj.display_name or f_obj.filename).lower()
-                        if any(fname.endswith(ext) for ext in [".pdf", ".docx", ".txt"]):
-                            extracted = self._download_and_extract_file(f_obj)
-                            if extracted:
-                                text_chunks.append(extracted)
-            else:
-                # If you want to parse *all* modules, remove this 'else' block
-                pass
+            items = list(mod.get_module_items())
+            for it in items:
+                # If the item is a file, we can parse it
+                if it.type == "File":
+                    f_obj = it.get_file()
+                    fname = (f_obj.display_name or f_obj.filename).lower()
+                    if any(fname.endswith(ext) for ext in [".pdf", ".docx", ".txt"]):
+                        extracted = self._download_and_extract_file(f_obj)
+                        if extracted:
+                            text_chunks.append(extracted)
 
         return "\n\n".join(text_chunks)
 
@@ -253,15 +254,16 @@ class CanvasCalendarGenerator:
                 f.write(content)
 
             # Extract text by extension
-            if fname.lower().endswith(".pdf"):
+            fname_lower = fname.lower()
+            if fname_lower.endswith(".pdf"):
                 return self._extract_pdf_text(fname)
-            elif fname.lower().endswith(".docx"):
+            elif fname_lower.endswith(".docx"):
                 return self._extract_docx_text(fname)
-            elif fname.lower().endswith(".txt"):
+            elif fname_lower.endswith(".txt"):
                 with open(fname, "r", encoding="utf-8", errors="ignore") as tf:
                     return tf.read()
             else:
-                return ""  # Should never get here due to filtering
+                return ""
         except Exception as ex:
             console.print(f"[red]Error downloading/extracting file '{file_obj.filename}': {ex}[/red]")
             return ""
@@ -285,7 +287,7 @@ class CanvasCalendarGenerator:
         d = docx.Document(docx_path)
         return "\n".join(p.text for p in d.paragraphs)
 
-    def _match_assignments_with_dates(self, assignments: List[Assignment], data: List[Dict]) -> None:
+    def _match_assignments_with_dates(self, assignments: List[Assignment], gpt_data: List[Dict]) -> None:
         """
         Cross-reference GPT output with actual Canvas assignments via SpaCy similarity,
         then update the due date if found. Example GPT structure:
@@ -301,7 +303,7 @@ class CanvasCalendarGenerator:
 
             best_score = 0.0
             best_item = None
-            for item in data:
+            for item in gpt_data:
                 gpt_name = item.get("name", "")
                 if not a.name or not gpt_name:
                     continue
@@ -319,7 +321,7 @@ class CanvasCalendarGenerator:
 
     def _apply_local_utc_date(self, assignment: Assignment, date_str: str) -> None:
         """
-        Convert date_str (YYYY-MM-DD) into local timezone midnight or 23:59,
+        Convert date_str (YYYY-MM-DD) into local timezone (23:59),
         then store as assignment.due_at in UTC.
         """
         try:
@@ -340,7 +342,6 @@ class CanvasCalendarGenerator:
                 if not dt_str:
                     break
 
-                # Try multiple date formats
                 date_parsed = self._try_parse_date(dt_str)
                 if not date_parsed:
                     console.print("[red]Invalid date format.[/red]")
@@ -392,6 +393,7 @@ class CanvasCalendarGenerator:
                 dt_utc = datetime.strptime(a.due_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
             except ValueError:
                 continue
+
             dt_local = dt_utc.astimezone(local_zone)
 
             event = Event()
