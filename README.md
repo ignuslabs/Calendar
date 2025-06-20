@@ -1,2 +1,1 @@
-# Calendar jawn
-thanks h o e
+Screwing around with Canvas API and extensions
